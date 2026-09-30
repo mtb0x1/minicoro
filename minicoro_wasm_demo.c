@@ -1,4 +1,4 @@
-#include "minicoro.c"
+#include "minicoro.h"
 
 #define MCO_WASM_DEMO_MAX_COROUTINES 64
 
