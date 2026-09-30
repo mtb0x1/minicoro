@@ -406,14 +406,41 @@ extern "C" {
 
 #define _MCO_UNUSED(x) (void)(x)
 
+#if !defined(__wasm__) || !defined(MCO_USE_VMEM_ALLOCATOR)
+#include <string.h>
+#endif
+
+#if defined(__wasm__) && defined(MCO_USE_VMEM_ALLOCATOR)
+static void* _mco_wasm_memset(void* dest, int value, size_t size) {
+  volatile unsigned char* dest_bytes = (volatile unsigned char*)dest;
+  size_t i;
+  for(i = 0; i < size; i++) {
+    dest_bytes[i] = (unsigned char)value;
+  }
+  return dest;
+}
+
+static void* _mco_wasm_memcpy(void* dest, const void* src, size_t size) {
+  volatile unsigned char* dest_bytes = (volatile unsigned char*)dest;
+  const volatile unsigned char* src_bytes = (const volatile unsigned char*)src;
+  size_t i;
+  for(i = 0; i < size; i++) {
+    dest_bytes[i] = src_bytes[i];
+  }
+  return dest;
+}
+
+#define memset _mco_wasm_memset
+#define memcpy _mco_wasm_memcpy
+#endif
+
 #if !defined(MCO_NO_DEBUG) && !defined(NDEBUG) && !defined(MCO_DEBUG)
 #define MCO_DEBUG
 #endif
 
 #ifndef MCO_LOG
   #ifdef MCO_DEBUG
-    #include <stdio.h>
-    #define MCO_LOG(s) puts(s)
+    #define MCO_LOG(s)
   #else
     #define MCO_LOG(s)
   #endif
@@ -421,8 +448,7 @@ extern "C" {
 
 #ifndef MCO_ASSERT
   #ifdef MCO_DEBUG
-    #include <assert.h>
-    #define MCO_ASSERT(c) assert(c)
+    #define MCO_ASSERT(c)
   #else
     #define MCO_ASSERT(c)
   #endif
@@ -432,36 +458,13 @@ extern "C" {
   #ifdef MCO_NO_MULTITHREAD
     #define MCO_THREAD_LOCAL
   #else
-    #ifdef thread_local
-      #define MCO_THREAD_LOCAL thread_local
-    #elif __STDC_VERSION__ >= 201112 && !defined(__STDC_NO_THREADS__)
-      #define MCO_THREAD_LOCAL _Thread_local
-    #elif defined(_WIN32) && (defined(_MSC_VER) || defined(__ICL) ||  defined(__DMC__) ||  defined(__BORLANDC__))
-      #define MCO_THREAD_LOCAL __declspec(thread)
-    #elif defined(__GNUC__) || defined(__SUNPRO_C) || defined(__xlC__)
-      #define MCO_THREAD_LOCAL __thread
-    #else /* No thread local support, `mco_running` will be thread unsafe. */
       #define MCO_THREAD_LOCAL
       #define MCO_NO_MULTITHREAD
     #endif
   #endif
-#endif
 
-#ifndef MCO_FORCE_INLINE
-  #ifdef _MSC_VER
-    #define MCO_FORCE_INLINE __forceinline
-  #elif defined(__GNUC__)
-    #if defined(__STRICT_ANSI__)
-      #define MCO_FORCE_INLINE __inline__ __attribute__((always_inline))
-    #else
-      #define MCO_FORCE_INLINE inline __attribute__((always_inline))
-    #endif
-  #elif defined(__BORLANDC__) || defined(__DMC__) || defined(__SC__) || defined(__WATCOMC__) || defined(__LCC__) ||  defined(__DECC)
-    #define MCO_FORCE_INLINE __inline
-  #else /* No inline support. */
-    #define MCO_FORCE_INLINE
-  #endif
-#endif
+#define MCO_FORCE_INLINE
+
 
 #ifndef MCO_NO_INLINE
   #ifdef __GNUC__
@@ -485,47 +488,102 @@ extern "C" {
 
 #ifndef MCO_NO_DEFAULT_ALLOCATOR
   #if defined(MCO_USE_VMEM_ALLOCATOR) && defined(_WIN32)
-    static void* mco_alloc(size_t size, void* allocator_data) {
-      _MCO_UNUSED(allocator_data);
-      return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+static void* mco_alloc(size_t size, void* allocator_data) {
+  _MCO_UNUSED(allocator_data);
+  return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+static void mco_dealloc(void* ptr, size_t size, void* allocator_data) {
+  _MCO_UNUSED(allocator_data);
+  _MCO_UNUSED(size);
+  int res = VirtualFree(ptr, 0, MEM_RELEASE);
+  _MCO_UNUSED(res);
+  MCO_ASSERT(res != 0);
+}
+  #elif defined(MCO_USE_VMEM_ALLOCATOR) && defined(__wasm__)
+typedef struct _mco_wasm_alloc_block {
+  struct _mco_wasm_alloc_block* next;
+  size_t size;
+} _mco_wasm_alloc_block;
+
+static _mco_wasm_alloc_block* _mco_wasm_free_blocks = NULL;
+
+static void* mco_alloc(size_t size, void* allocator_data) {
+  const size_t header_size = (sizeof(_mco_wasm_alloc_block) + 15) & ~(size_t)15;
+  const size_t max_size = (size_t)-1;
+  _mco_wasm_alloc_block** block_ptr = &_mco_wasm_free_blocks;
+  _mco_wasm_alloc_block* block;
+  size_t required_size;
+  size_t pages;
+  size_t old_pages;
+  _MCO_UNUSED(allocator_data);
+  if(size > max_size - header_size) {
+    return NULL;
+  }
+  while(*block_ptr) {
+    if((*block_ptr)->size >= size) {
+      block = *block_ptr;
+      *block_ptr = block->next;
+      return (unsigned char*)block + header_size;
     }
-    static void mco_dealloc(void* ptr, size_t size, void* allocator_data) {
-      _MCO_UNUSED(allocator_data);
-      _MCO_UNUSED(size);
-      int res = VirtualFree(ptr, 0, MEM_RELEASE);
-      _MCO_UNUSED(res);
-      MCO_ASSERT(res != 0);
-    }
+    block_ptr = &(*block_ptr)->next;
+  }
+  required_size = size + header_size;
+  if(required_size > max_size - 65535) {
+    return NULL;
+  }
+  pages = (required_size + 65535) / 65536;
+  if(pages > max_size / 65536) {
+    return NULL;
+  }
+  old_pages = __builtin_wasm_memory_grow(0, pages);
+  if(old_pages == max_size) {
+    return NULL;
+  }
+  block = (_mco_wasm_alloc_block*)(old_pages * 65536);
+  block->size = pages * 65536 - header_size;
+  return (unsigned char*)block + header_size;
+}
+
+static void mco_dealloc(void* ptr, size_t size, void* allocator_data) {
+  const size_t header_size = (sizeof(_mco_wasm_alloc_block) + 15) & ~(size_t)15;
+  _mco_wasm_alloc_block* block;
+  _MCO_UNUSED(size);
+  _MCO_UNUSED(allocator_data);
+  if(!ptr) {
+    return;
+  }
+  block = (_mco_wasm_alloc_block*)((unsigned char*)ptr - header_size);
+  block->next = _mco_wasm_free_blocks;
+  _mco_wasm_free_blocks = block;
+}
   #elif defined(MCO_USE_VMEM_ALLOCATOR) /* POSIX virtual memory allocator */
-    #include <sys/mman.h>
-    static void* mco_alloc(size_t size, void* allocator_data) {
-      _MCO_UNUSED(allocator_data);
-      void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      return ptr != MAP_FAILED ? ptr : NULL;
-    }
-    static void mco_dealloc(void* ptr, size_t size, void* allocator_data) {
-      _MCO_UNUSED(allocator_data);
-      int res = munmap(ptr, size);
-      _MCO_UNUSED(res);
-      MCO_ASSERT(res == 0);
-    }
+#include <sys/mman.h>
+static void* mco_alloc(size_t size, void* allocator_data) {
+  _MCO_UNUSED(allocator_data);
+  void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return ptr != MAP_FAILED ? ptr : NULL;
+}
+static void mco_dealloc(void* ptr, size_t size, void* allocator_data) {
+  _MCO_UNUSED(allocator_data);
+  int res = munmap(ptr, size);
+  _MCO_UNUSED(res);
+  MCO_ASSERT(res == 0);
+}
   #else /* C allocator */
     #ifndef MCO_ALLOC
       #include <stdlib.h>
-      /* We use calloc() so we give a chance for the OS to reserve virtual memory without really using physical memory,
-         calloc() also has the nice property of initializing the stack to zeros. */
       #define MCO_ALLOC(size) calloc(1, size)
       #define MCO_DEALLOC(ptr, size) free(ptr)
     #endif
-    static void* mco_alloc(size_t size, void* allocator_data) {
-      _MCO_UNUSED(allocator_data);
-      return MCO_ALLOC(size);
-    }
-    static void mco_dealloc(void* ptr, size_t size, void* allocator_data) {
-      _MCO_UNUSED(size);
-      _MCO_UNUSED(allocator_data);
-      MCO_DEALLOC(ptr, size);
-    }
+static void* mco_alloc(size_t size, void* allocator_data) {
+  _MCO_UNUSED(allocator_data);
+  return MCO_ALLOC(size);
+}
+static void mco_dealloc(void* ptr, size_t size, void* allocator_data) {
+  _MCO_UNUSED(size);
+  _MCO_UNUSED(allocator_data);
+  MCO_DEALLOC(ptr, size);
+}
   #endif /* MCO_USE_VMEM_ALLOCATOR */
 #endif /* MCO_NO_DEFAULT_ALLOCATOR */
 
@@ -553,8 +611,6 @@ void* __tsan_create_fiber(unsigned flags);
 void __tsan_destroy_fiber(void* fiber);
 void __tsan_switch_to_fiber(void* fiber, unsigned flags);
 #endif
-
-#include <string.h> /* For memcpy and memset. */
 
 /* Utility for aligning addresses. */
 static MCO_FORCE_INLINE size_t _mco_align_forward(size_t addr, size_t align) {
