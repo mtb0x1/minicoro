@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Minicoro | wasm allocator test</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f4f5ef;
+      --ink: #202b27;
+      --muted: #68746e;
+      --line: #d4dbd4;
+      --green: #146b50;
+      --green-soft: #e1f0e8;
+      --red: #a1372e;
+      --panel: #fffefa;
+      font-family: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      background: var(--paper);
+      color: var(--ink);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background-image: linear-gradient(90deg, transparent 39px, rgba(32, 43, 39, .045) 40px, transparent 41px);
+      background-size: 80px 100%;
+    }
+    main { width: min(860px, calc(100% - 40px)); margin: 0 auto; padding: 54px 0 72px; }
+    .eyebrow { color: var(--green); font-size: 12px; font-weight: 700; text-transform: uppercase; }
+    h1 { margin: 14px 0 8px; font: 600 38px/1.08 Georgia, "Times New Roman", serif; }
+    .intro { max-width: 620px; margin: 0; color: var(--muted); font: 16px/1.6 system-ui, sans-serif; }
+    .rule { height: 1px; margin: 28px 0; background: var(--line); }
+    .controls { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; }
+    label { display: grid; gap: 7px; color: var(--muted); font-size: 11px; text-transform: uppercase; }
+    input, button { min-height: 42px; border: 1px solid var(--line); border-radius: 4px; font: inherit; }
+    input { width: 112px; padding: 0 10px; background: var(--panel); color: var(--ink); }
+    button { padding: 0 16px; background: var(--green); border-color: var(--green); color: white; cursor: pointer; font-weight: 700; }
+    button:disabled { cursor: progress; opacity: .55; }
+    .status { margin-left: auto; color: var(--muted); font-size: 12px; }
+    .status[data-state="ready"] { color: var(--green); }
+    .status[data-state="error"] { color: var(--red); }
+    .results { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; overflow: hidden; border: 1px solid var(--line); background: var(--line); }
+    .metric { min-height: 90px; padding: 16px; background: var(--panel); }
+    .metric span { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; }
+    .metric strong { display: block; margin-top: 10px; font-size: 18px; }
+    h2 { margin: 30px 0 10px; font-size: 13px; text-transform: uppercase; }
+    pre { min-height: 140px; margin: 0; padding: 16px; overflow: auto; border-left: 3px solid var(--green); background: #202b27; color: #d7e8dc; font: 12px/1.7 ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, monospace; white-space: pre-wrap; }
+    @media (max-width: 540px) {
+      main { width: min(100% - 28px, 860px); padding-top: 34px; }
+      h1 { font-size: 32px; }
+      .status { width: 100%; margin: 4px 0 0; }
+      .results { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">wasm32-unknown-unknown / no libc</div>
+    <h1>Minicoro allocator check</h1>
+    <p class="intro">Creates suspended coroutines in wasm linear memory, destroys them, then verifies the allocator reuses those blocks without growing memory again.</p>
+    <div class="rule"></div>
+
+    <section class="controls" aria-label="Allocator test controls">
+      <label for="count">Coroutines <input id="count" type="number" min="1" max="64" value="12"></label>
+      <button id="run" type="button" disabled>Run checks</button>
+      <output id="status" class="status" data-state="loading" aria-live="polite">Loading minicoro.wasm</output>
+    </section>
+
+    <div class="rule"></div>
+    <section class="results" aria-label="Test measurements">
+      <div class="metric"><span>Module</span><strong id="module-size">--</strong></div>
+      <div class="metric"><span>Memory after first allocation</span><strong id="first-memory">--</strong></div>
+      <div class="metric"><span>Memory after reuse pass</span><strong id="reuse-memory">--</strong></div>
+      <div class="metric"><span>Suspended in each pass</span><strong id="suspended-count">--</strong></div>
+    </section>
+
+    <h2>Test log</h2>
+    <pre id="log" aria-live="polite">Waiting for the wasm module.</pre>
+  </main>
+
+  <script>
+    const runButton = document.querySelector("#run");
+    const statusOutput = document.querySelector("#status");
+    const logOutput = document.querySelector("#log");
+    let wasm = null;
+
+    function log(message) {
+      logOutput.textContent += `\n${message}`;
+    }
+
+    function setStatus(message, state) {
+      statusOutput.textContent = message;
+      statusOutput.dataset.state = state;
+    }
+
+    function formatBytes(bytes) {
+      return `${(bytes / 1024).toFixed(0)} KiB (${bytes / 65536} pages)`;
+    }
+
+    async function loadWasm() {
+      const response = await fetch("./minicoro.wasm");
+      if (!response.ok) throw new Error(`Could not load minicoro.wasm (${response.status})`);
+      const bytes = await response.arrayBuffer();
+      const result = await WebAssembly.instantiate(bytes, {});
+      wasm = result.instance.exports;
+      for (const name of ["memory", "mco_demo_create_many", "mco_demo_suspended_count", "mco_demo_destroy_all"]) {
+        if (!(name in wasm)) throw new Error(`Missing wasm export: ${name}`);
+      }
+      document.querySelector("#module-size").textContent = `${bytes.byteLength} bytes`;
+      log(`Loaded wasm module (${bytes.byteLength} bytes).`);
+      setStatus("Ready", "ready");
+      runButton.disabled = false;
+    }
+
+    function assertTest(condition, message) {
+      if (!condition) throw new Error(message);
+      log(`PASS  ${message}`);
+    }
+
+    async function runChecks() {
+      runButton.disabled = true;
+      logOutput.textContent = "Running allocator checks...";
+      try {
+        const count = Number(document.querySelector("#count").value);
+        if (!Number.isInteger(count) || count < 1 || count > 64) {
+          throw new Error("Choose between 1 and 64 coroutines.");
+        }
+
+        const initialBytes = wasm.memory.buffer.byteLength;
+        assertTest(wasm.mco_demo_create_many(count) === 0, "coroutine allocations succeed");
+        assertTest(wasm.mco_demo_suspended_count() === count, "all created coroutines start suspended");
+        const allocatedBytes = wasm.memory.buffer.byteLength;
+        document.querySelector("#first-memory").textContent = formatBytes(allocatedBytes);
+        assertTest(wasm.mco_demo_destroy_all() === 0, "all coroutine allocations are deallocated");
+        assertTest(wasm.mco_demo_suspended_count() === 0, "destroy clears the active coroutine set");
+
+        assertTest(wasm.mco_demo_create_many(count) === 0, "a second allocation pass succeeds");
+        assertTest(wasm.mco_demo_suspended_count() === count, "reused coroutines start suspended");
+        const reusedBytes = wasm.memory.buffer.byteLength;
+        document.querySelector("#reuse-memory").textContent = formatBytes(reusedBytes);
+        document.querySelector("#suspended-count").textContent = `${count} / ${count}`;
+        assertTest(reusedBytes === allocatedBytes, "freed blocks are reused without growing linear memory");
+        assertTest(wasm.mco_demo_destroy_all() === 0, "second pass deallocates cleanly");
+        log(`Memory before test: ${formatBytes(initialBytes)}.`);
+        setStatus("All checks passed", "ready");
+      } catch (error) {
+        log(`FAIL  ${error.message}`);
+        setStatus("Checks failed", "error");
+      } finally {
+        runButton.disabled = false;
+      }
+    }
+
+    runButton.addEventListener("click", runChecks);
+    loadWasm().catch((error) => {
+      logOutput.textContent = `Could not start: ${error.message}\nBuild with ./minicoro.sh, then serve this directory over HTTP.`;
+      setStatus("Module unavailable", "error");
+    });
+  </script>
+</body>
+</html>
